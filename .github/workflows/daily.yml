@@ -1,0 +1,88 @@
+name: Publicar Short diario
+
+on:
+  schedule:
+    - cron: "0 7 * * *"
+    - cron: "0 12 * * *"
+    - cron: "0 16 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publicar:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Elegir franja del dia
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "go=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          DOY=$(date -u +%j); DOY=$((10#$DOY))
+          H=$(date -u +%H);  H=$((10#$H))
+          SLOT=$((DOY % 3))
+          case $SLOT in
+            0) WANT=7 ;;
+            1) WANT=12 ;;
+            2) WANT=16 ;;
+          esac
+          if [ "$H" -eq "$WANT" ] || [ "$H" -eq "$((WANT+1))" ]; then
+            echo "go=true" >> $GITHUB_OUTPUT
+          else
+            echo "go=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Descargar el repo
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar ffmpeg
+        if: steps.gate.outputs.go == 'true'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Instalar dependencias
+        if: steps.gate.outputs.go == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Generar el video del dia
+        if: steps.gate.outputs.go == 'true'
+        env:
+          TTS_ENGINE: edge
+          EDGE_VOICE: es-ES-AlvaroNeural
+          EDGE_RATE: ${{ secrets.EDGE_RATE }}
+          CHANNEL_HANDLE: ${{ secrets.CHANNEL_HANDLE }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+        run: python generate.py
+
+      - name: Espera pequena
+        if: steps.gate.outputs.go == 'true'
+        run: sleep $((RANDOM % 240))
+
+      - name: Subir a YouTube
+        if: steps.gate.outputs.go == 'true'
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY: public
+          YT_CATEGORY: "27"
+        run: python upload.py
+
+      - name: Guardar el video como artefacto
+        if: steps.gate.outputs.go == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-del-dia
+          path: output/*.mp4
+          retention-days: 7
