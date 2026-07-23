@@ -57,7 +57,7 @@ jobs:
         if: steps.gate.outputs.go == 'true'
         env:
           TTS_ENGINE: edge
-          EDGE_VOICE: es-ES-AlvaroNeural
+          EDGE_VOICE: es-ES-ElviraNeural
           EDGE_RATE: ${{ secrets.EDGE_RATE }}
           CHANNEL_HANDLE: ${{ secrets.CHANNEL_HANDLE }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
