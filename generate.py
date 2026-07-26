@@ -330,16 +330,33 @@ def _audio_oneshot(lines, workdir):
     text = "  ".join(l.get("voice", "").strip() for l in lines if l.get("voice"))
     words = synth_edge_full(text, full)
     total = dur_of(full)
+    if total <= 0:
+        raise RuntimeError("audio vacío")
     counts = [max(1, len(l.get("voice", "").split())) for l in lines]
-    if not words or len(words) < sum(counts) * 0.6:
-        raise RuntimeError("tiempos de palabra insuficientes")
-    spans = []; idx = 0
-    for c in counts:
-        seg = words[idx:idx + c]; idx += c
-        if seg:
-            spans.append((seg[0][0], seg[-1][0] + seg[-1][1]))
-        else:
-            last = words[-1]; spans.append((last[0] + last[1], last[0] + last[1]))
+
+    # Camino A: hay tiempos de palabra suficientes -> spans precisos por línea.
+    if words and len(words) >= sum(counts) * 0.6:
+        spans = []; idx = 0
+        for c in counts:
+            seg = words[idx:idx + c]; idx += c
+            if seg:
+                spans.append((seg[0][0], seg[-1][0] + seg[-1][1]))
+            else:
+                last = words[-1]; spans.append((last[0] + last[1], last[0] + last[1]))
+        spans[-1] = (spans[-1][0], total)
+        return full, spans, total
+
+    # Camino B: faltan tiempos de palabra -> NO caemos a frase-a-frase (menos
+    # fluido). Mantenemos la locución continua y repartimos la duración total
+    # de forma proporcional al tamaño de cada frase. La voz sigue siendo fluida
+    # y los subtítulos quedan bien sincronizados.
+    sys.stderr.write("[tts] one-shot sin tiempos de palabra; reparto proporcional (voz continua igualmente).\n")
+    weights = [max(1, len(l.get("voice", "").strip())) for l in lines]
+    wsum = sum(weights)
+    spans = []; t = 0.0
+    for w in weights:
+        d = total * (w / wsum)
+        spans.append((t, t + d)); t += d
     spans[-1] = (spans[-1][0], total)
     return full, spans, total
 
