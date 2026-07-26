@@ -52,6 +52,24 @@ def synth_edge(text, out_wav):
     run(["ffmpeg","-y","-loglevel","error","-i",tmp_mp3,"-ar","44100","-ac","2",out_wav])
     os.remove(tmp_mp3)
 
+def synth_edge_full(text, out_wav):
+    """Locución completa de una vez (fluida) + tiempos de cada palabra."""
+    import edge_tts
+    tmp_mp3 = out_wav + ".mp3"
+    words = []
+    async def _go():
+        c = edge_tts.Communicate(text, EDGE_VOICE, rate=os.environ.get("EDGE_RATE", "+0%"))
+        with open(tmp_mp3, "wb") as f:
+            async for ch in c.stream():
+                if ch["type"] == "audio":
+                    f.write(ch["data"])
+                elif ch["type"] == "WordBoundary":
+                    words.append((ch["offset"] / 1e7, ch["duration"] / 1e7, ch["text"]))
+    asyncio.run(_go())
+    run(["ffmpeg","-y","-loglevel","error","-i",tmp_mp3,"-ar","44100","-ac","2",out_wav])
+    os.remove(tmp_mp3)
+    return words
+
 def synth(text, out_wav):
     if TTS_ENGINE == "edge":
         synth_edge(text, out_wav)
@@ -72,7 +90,7 @@ def esc(t):
 HL = "&H0037B6FF&"   # amarillo/ámbar para la palabra activa (BBGGRR)
 WHITE = "&H00FFFFFF&"
 
-def cap_word_events(cap, st, en, words_per_line=3):
+def cap_word_events(cap, st, en, words_per_line=2):
     """Subtítulos animados: la palabra que se pronuncia se resalta y crece."""
     words = cap.split()
     if not words:
@@ -95,8 +113,8 @@ def cap_word_events(cap, st, en, words_per_line=3):
             wtxt = esc(w.upper())
             if j == i:
                 # palabra activa: salta (pop con escala) y se resalta en color
-                toks.append("{\\c" + HL + "\\fscx86\\fscy86\\t(0,110,\\fscx122\\fscy122)"
-                            "\\t(110,220,\\fscx108\\fscy108)}" + wtxt
+                toks.append("{\\c" + HL + "\\fscx92\\fscy92\\t(0,110,\\fscx110\\fscy110)"
+                            "\\t(110,220,\\fscx103\\fscy103)}" + wtxt
                             + "{\\c" + WHITE + "\\fscx100\\fscy100}")
             elif j < i:
                 # ya dicha: blanca, ligeramente mayor
@@ -126,7 +144,7 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Main,{FONT},80,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,1,0,1,6,3,2,80,80,720,1
+Style: Main,{FONT},72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,1,0,1,5,3,2,140,140,700,1
 Style: Brand,{FONT},42,&H50FFFFFF,&H50FFFFFF,&H90000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,40,40,80,1
 
 [Events]
@@ -297,8 +315,35 @@ def build_background(script, total, workdir, spans):
         sys.stderr.write(f"[bg] concat falló ({e})\n")
         return None
 
-# ---------- Audio (frase a frase, sin silencios = sincronía EXACTA y fluida) ----------
+# ---------- Audio ----------
 def build_audio(lines, workdir):
+    # edge: una sola locución continua (fluida) + tiempos de palabra reales
+    if TTS_ENGINE == "edge":
+        try:
+            return _audio_oneshot(lines, workdir)
+        except Exception as e:
+            sys.stderr.write(f"[tts] one-shot falló ({e}); voy frase a frase.\n")
+    return _audio_perline(lines, workdir)
+
+def _audio_oneshot(lines, workdir):
+    full = os.path.join(workdir, "full.wav")
+    text = "  ".join(l.get("voice", "").strip() for l in lines if l.get("voice"))
+    words = synth_edge_full(text, full)
+    total = dur_of(full)
+    counts = [max(1, len(l.get("voice", "").split())) for l in lines]
+    if not words or len(words) < sum(counts) * 0.6:
+        raise RuntimeError("tiempos de palabra insuficientes")
+    spans = []; idx = 0
+    for c in counts:
+        seg = words[idx:idx + c]; idx += c
+        if seg:
+            spans.append((seg[0][0], seg[-1][0] + seg[-1][1]))
+        else:
+            last = words[-1]; spans.append((last[0] + last[1], last[0] + last[1]))
+    spans[-1] = (spans[-1][0], total)
+    return full, spans, total
+
+def _audio_perline(lines, workdir):
     parts = []; spans = []; t = 0.0
     for i, ln in enumerate(lines):
         w = os.path.join(workdir, f"seg{i:02d}.wav")
@@ -342,9 +387,13 @@ def build_video(script, out_path, workdir):
 
     music_file = None
     if os.path.isdir(MUSIC):
-        for fn in sorted(os.listdir(MUSIC)):
-            if fn.lower().endswith((".mp3",".m4a",".wav",".ogg")):
-                music_file = os.path.join(MUSIC, fn); break
+        tracks = sorted(os.path.join(MUSIC, fn) for fn in os.listdir(MUSIC)
+                        if fn.lower().endswith((".mp3", ".m4a", ".wav", ".ogg")))
+        if tracks:
+            import datetime
+            yday = datetime.date.today().timetuple().tm_yday
+            run_n = int(os.environ.get("GITHUB_RUN_NUMBER", "0") or "0")
+            music_file = tracks[(yday + run_n) % len(tracks)]   # va alternando
 
     ass_esc = ass.replace("\\","/").replace(":","\\:")
     if bgv:
