@@ -53,9 +53,18 @@ Reglas del guion:
 - Español, cercano, directo y con GARRA (tono motivacional que impacte y active). Frases cortas y potentes.
 """
 
-def _pick(lst):
+def _run_seed():
+    # Número de ejecución del workflow: cambia en CADA run, también el mismo día.
+    try:
+        return int(os.environ.get("GITHUB_RUN_NUMBER", "0"))
+    except ValueError:
+        return 0
+
+def _pick(lst, salt=0):
+    # Combina el día del año con el número de ejecución: así dos vídeos
+    # generados el MISMO día eligen tema/formato distintos (no se repiten).
     y = datetime.date.today().timetuple().tm_yday
-    return lst[y % len(lst)]
+    return lst[(y + _run_seed() + salt) % len(lst)]
 
 def _call_gemini(prompt, key):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}"
@@ -94,10 +103,14 @@ def generate():
         master = open(os.path.join(BASE, "PROMPT-MAESTRO.md"), encoding="utf-8").read()
     except Exception:
         master = "Eres un productor experto de YouTube Shorts de economía en español."
-    tema, formato = _pick(TEMAS), _pick(FORMATOS)
+    tema, formato = _pick(TEMAS), _pick(FORMATOS, salt=2)
+    seed = _run_seed()
     prompt = (master
               + "\n\n---\nTAREA DE HOY:\n"
               + f"Crea el Short de hoy sobre: {tema}. Formato: {formato}.\n"
+              + f"Dale un ENFOQUE ORIGINAL y distinto a cualquier vídeo anterior "
+              + f"(variación #{seed}): cambia el gancho, el ejemplo y las frases exactas. "
+              + "No repitas estructuras ni frases hechas.\n"
               + "Cumple TODAS las reglas de arriba (cumplimiento primero, luego viralidad).\n"
               + SCHEMA_INSTRUCCION)
     try:
