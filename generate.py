@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Generador de Shorts de economía (100% gratis, sin servicios de pago).
+Generador de Shorts (100% gratis, sin servicios de pago).
 Flujo: guion -> voz (edge-tts o espeak) -> subtítulos sincronizados ->
-fondo con movimiento + gráfica -> vídeo vertical 1080x1920.
+fondo con movimiento -> vídeo vertical 1080x1920.
 
 TTS_ENGINE=edge  -> voz neuronal (para GitHub Actions, buena calidad)
 TTS_ENGINE=espeak-> voz offline (prueba de formato en local)
@@ -13,7 +13,10 @@ import urllib.request, urllib.parse, datetime
 BASE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(BASE, "assets")
 OUTPUT = os.path.join(BASE, "output")
+# Carpeta de música: acepta "music" o "musica" (por si se nombró en español)
 MUSIC = os.path.join(BASE, "music")
+if not os.path.isdir(MUSIC) and os.path.isdir(os.path.join(BASE, "musica")):
+    MUSIC = os.path.join(BASE, "musica")
 os.makedirs(OUTPUT, exist_ok=True)
 
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "espeak")
@@ -76,6 +79,19 @@ def synth(text, out_wav):
     else:
         synth_espeak(text, out_wav)
 
+# Texto para la locución: une las frases con una pausa MÁS CORTA (coma en vez
+# de punto y seguido) para que el narrador vaya más fluido entre frases.
+def _tts_join(lines):
+    parts = []
+    for l in lines:
+        v = (l.get("voice", "") or "").strip()
+        if not v:
+            continue
+        if v.endswith("."):
+            v = v[:-1]          # quita solo el punto final -> pausa más corta
+        parts.append(v)
+    return ", ".join(parts)
+
 # ---------- Subtítulos ASS ----------
 def ass_time(t):
     cs = int(round(t*100))
@@ -90,47 +106,27 @@ def esc(t):
 HL = "&H0037B6FF&"   # amarillo/ámbar para la palabra activa (BBGGRR)
 WHITE = "&H00FFFFFF&"
 
-def cap_word_events(cap, st, en, words_per_line=2):
-    """Subtítulos animados: la palabra que se pronuncia se resalta y crece."""
+def cap_word_events(cap, st, en, chunk=1):
+    """Una palabra a la vez, centrada y quieta, sincronizada con la voz.
+    Limpio y sin parpadeos: cada palabra aparece cuando se dice y la
+    sustituye la siguiente (nada de recolocar ni animaciones que saltan)."""
     words = cap.split()
     if not words:
         return []
     weights = [len(w) + 1 for w in words]
     tot = sum(weights)
     dur = max(0.001, en - st)
-    slices = []
+    tspan = []
     cur = st
     for wt in weights:
         wd = dur * wt / tot
-        slices.append((cur, cur + wd))
+        tspan.append((cur, cur + wd))
         cur += wd
     evts = []
-    for i, (ws, we) in enumerate(slices):
-        toks = []
-        for j, w in enumerate(words):
-            if j > 0 and j % words_per_line == 0:
-                toks.append("\\N")
-            wtxt = esc(w.upper())
-            if j == i:
-                # palabra activa: salta (pop con escala) y se resalta en color
-                toks.append("{\\c" + HL + "\\fscx92\\fscy92\\t(0,110,\\fscx110\\fscy110)"
-                            "\\t(110,220,\\fscx103\\fscy103)}" + wtxt
-                            + "{\\c" + WHITE + "\\fscx100\\fscy100}")
-            elif j < i:
-                # ya dicha: blanca, ligeramente mayor
-                toks.append("{\\fscx104\\fscy104}" + wtxt + "{\\fscx100\\fscy100}")
-            else:
-                # por venir: tenue, para guiar la vista
-                toks.append("{\\alpha&H66&}" + wtxt + "{\\alpha&H00&}")
-        # unir con espacios pero sin espacio extra tras un salto de línea
-        s = ""
-        for k, tk in enumerate(toks):
-            if tk == "\\N":
-                s += "\\N"
-            else:
-                s += ("" if (k == 0 or toks[k-1] == "\\N") else " ") + tk
-        fad = "{\\fad(140,0)}" if i == 0 else ""
-        evts.append((ws, we, fad + s))
+    for wi, w in enumerate(words):
+        ws = tspan[wi][0]
+        we = tspan[wi + 1][0] if wi + 1 < len(words) else en
+        evts.append((ws, we, "{\\fad(70,0)}" + esc(w.upper())))
     return evts
 
 def build_ass(events, path, handle=None, total=0.0):
@@ -139,12 +135,12 @@ def build_ass(events, path, handle=None, total=0.0):
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
-WrapStyle: 2
+WrapStyle: 0
 ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Main,{FONT},72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,1,0,1,5,3,2,140,140,700,1
+Style: Main,{FONT},82,&H00FFFFFF,&H00FFFFFF,&H00000000,&H90000000,-1,0,0,0,100,100,1,0,1,6,4,2,120,120,720,1
 Style: Brand,{FONT},42,&H50FFFFFF,&H50FFFFFF,&H90000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,40,40,80,1
 
 [Events]
@@ -172,7 +168,7 @@ def _pexels_clips(query, n, workdir):
                + urllib.parse.urlencode({"query": query, "orientation": "portrait",
                                          "per_page": 20, "size": "medium"}))
         req = urllib.request.Request(url, headers={"Authorization": key})
-        with urllib.request.urlopen(req, timeout=25) as r:
+        with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read().decode())
         vids = data.get("videos", [])
         out = []
@@ -181,10 +177,10 @@ def _pexels_clips(query, n, workdir):
                      if (f.get("height") or 0) >= (f.get("width") or 0)] or vid.get("video_files", [])
             if not files:
                 continue
-            files.sort(key=lambda f: abs((f.get("width") or 1080) - 1080))
+            files.sort(key=lambda f: (0 if (f.get("width") or 0) >= 1080 else 1, -(f.get("width") or 0)))
             dst = os.path.join(workdir, f"src_{j}.mp4")
             try:
-                with urllib.request.urlopen(files[0]["link"], timeout=60) as r, open(dst, "wb") as f:
+                with urllib.request.urlopen(files[0]["link"], timeout=20) as r, open(dst, "wb") as f:
                     f.write(r.read())
                 if os.path.getsize(dst) > 10000:
                     out.append(dst)
@@ -205,20 +201,22 @@ def _pixabay_clips(query, n, workdir):
     try:
         url = "https://pixabay.com/api/videos/?" + urllib.parse.urlencode(
             {"key": key, "q": query, "per_page": max(3, min(n * 2, 20)), "safesearch": "true"})
-        req = urllib.request.Request(url, headers={"User-Agent": "economia-bot/1.0"})
-        with urllib.request.urlopen(req, timeout=25) as r:
+        req = urllib.request.Request(url, headers={"User-Agent": "canal-bot/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read().decode())
         hits = data.get("hits", [])
+        # prioriza clips verticales (menos recorte/estirado) para más nitidez
+        hits = sorted(hits, key=lambda h: (h.get("width", 1) / max(1, h.get("height", 1))))
         out = []
         for j, h in enumerate(hits[:n]):
             v = h.get("videos", {})
-            f = v.get("medium") or v.get("large") or v.get("small") or v.get("tiny")
+            f = v.get("large") or v.get("medium") or v.get("small") or v.get("tiny")
             if not f or not f.get("url"):
                 continue
             dst = os.path.join(workdir, f"src_{j}.mp4")
             try:
-                rq = urllib.request.Request(f["url"], headers={"User-Agent": "economia-bot/1.0"})
-                with urllib.request.urlopen(rq, timeout=60) as r, open(dst, "wb") as fo:
+                rq = urllib.request.Request(f["url"], headers={"User-Agent": "canal-bot/1.0"})
+                with urllib.request.urlopen(rq, timeout=20) as r, open(dst, "wb") as fo:
                     fo.write(r.read())
                 if os.path.getsize(dst) > 10000:
                     out.append(dst)
@@ -244,15 +242,17 @@ def _gather_clips(script, workdir):
     if ldir and os.path.isdir(ldir):
         return [os.path.join(ldir, f) for f in sorted(os.listdir(ldir))
                 if f.lower().endswith((".mp4", ".mov", ".webm", ".mkv", ".m4v"))]
-    return _clips_for_query(script.get("broll"), 8, workdir)
+    return _clips_for_query(script.get("broll"), 4, workdir)
 
 def _norm_clip(src, dur, out):
     # recorte a vertical + push-in suave (zoom que da movimiento y "punch" en cada corte)
-    vf = ("scale=1188:2112:force_original_aspect_ratio=increase,crop=1188:2112,"
-          "zoompan=z='min(1.02+0.0011*in,1.16)':d=1:"
-          "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,setsar=1")
+    # supersampling (1440 -> 1080) + zoom más suave + enfoque = fondo más nítido
+    vf = ("scale=1440:2560:force_original_aspect_ratio=increase,crop=1440:2560,"
+          "zoompan=z='min(1.02+0.0009*in,1.10)':d=1:"
+          "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,"
+          "unsharp=5:5:0.7:5:5:0.0,setsar=1")
     run(["ffmpeg","-y","-loglevel","error","-stream_loop","-1","-t",f"{dur:.2f}","-i",src,
-         "-vf",vf,"-an","-c:v","libx264","-preset","veryfast","-crf","23","-pix_fmt","yuv420p", out])
+         "-vf",vf,"-an","-c:v","libx264","-preset","fast","-crf","20","-pix_fmt","yuv420p", out])
 
 def _groups(nlines, n):
     """Reparte n líneas en n grupos contiguos lo más iguales posible."""
@@ -266,7 +266,6 @@ def _groups(nlines, n):
 
 def build_background(script, total, workdir, spans):
     """Fondo dinámico: un clip real por IDEA, con push-in. None si no hay clips."""
-    # fuentes: si el guion trae broll_list (una consulta por idea), un clip por consulta
     srcs = []
     blist = script.get("broll_list")
     if blist and not os.environ.get("LOCAL_BROLL_DIR") and (
@@ -327,7 +326,7 @@ def build_audio(lines, workdir):
 
 def _audio_oneshot(lines, workdir):
     full = os.path.join(workdir, "full.wav")
-    text = "  ".join(l.get("voice", "").strip() for l in lines if l.get("voice"))
+    text = _tts_join(lines)
     words = synth_edge_full(text, full)
     total = dur_of(full)
     if total <= 0:
@@ -344,12 +343,9 @@ def _audio_oneshot(lines, workdir):
             else:
                 last = words[-1]; spans.append((last[0] + last[1], last[0] + last[1]))
         spans[-1] = (spans[-1][0], total)
-        return full, spans, total
+        return full, spans, total, words
 
-    # Camino B: faltan tiempos de palabra -> NO caemos a frase-a-frase (menos
-    # fluido). Mantenemos la locución continua y repartimos la duración total
-    # de forma proporcional al tamaño de cada frase. La voz sigue siendo fluida
-    # y los subtítulos quedan bien sincronizados.
+    # Camino B: faltan tiempos de palabra -> reparto proporcional (voz continua).
     sys.stderr.write("[tts] one-shot sin tiempos de palabra; reparto proporcional (voz continua igualmente).\n")
     weights = [max(1, len(l.get("voice", "").strip())) for l in lines]
     wsum = sum(weights)
@@ -358,7 +354,7 @@ def _audio_oneshot(lines, workdir):
         d = total * (w / wsum)
         spans.append((t, t + d)); t += d
     spans[-1] = (spans[-1][0], total)
-    return full, spans, total
+    return full, spans, total, None
 
 def _audio_perline(lines, workdir):
     parts = []; spans = []; t = 0.0
@@ -375,20 +371,38 @@ def _audio_perline(lines, workdir):
     full = os.path.join(workdir, "full.wav")
     run(["ffmpeg","-y","-loglevel","error","-f","concat","-safe","0","-i",lst,"-c","copy",full])
     total = dur_of(full)
-    return full, spans, total
+    return full, spans, total, None
 
 # ---------- Render ----------
 def build_video(script, out_path, workdir):
     lines = script["lines"]
-    full_wav, spans, total = build_audio(lines, workdir)
+    full_wav, spans, total, word_times = build_audio(lines, workdir)
 
-    # Subtítulos CONTINUOS: cada uno se muestra hasta que empieza el siguiente
-    # (sin huecos en negro entre frases -> transición fluida).
+    # Subtítulos VERBATIM y SINCRONIZADOS AL 100%: cada palabra aparece justo
+    # cuando se pronuncia, usando los tiempos reales de la voz (edge-tts).
+    disp = [w for ln in lines for w in (ln.get("voice", "") or "").split()]
     events = []
-    for i, ln in enumerate(lines):
-        start = spans[i][0]
-        end = spans[i + 1][0] if i + 1 < len(lines) else total
-        events.append((start, end, ln.get("cap", ""), bool(ln.get("hide_caption"))))
+    if word_times and disp and len(word_times) >= max(1, int(len(disp) * 0.8)):
+        m = min(len(disp), len(word_times))
+        onsets = [word_times[k][0] for k in range(m)]
+        if m < len(disp):                       # raro: faltan tiempos al final
+            t0 = onsets[-1] if onsets else 0.0
+            step = max(0.05, (total - t0) / (len(disp) - m + 1))
+            for j in range(len(disp) - m):
+                onsets.append(t0 + step * (j + 1))
+        for k in range(len(disp)):
+            ws = onsets[k]
+            we = onsets[k + 1] if (k + 1 < len(disp)) else total
+            if we <= ws:
+                we = ws + 0.05
+            events.append((ws, we, disp[k], False))
+    else:
+        # reserva: reparto por línea (si no hubo tiempos de palabra)
+        for i, ln in enumerate(lines):
+            start = spans[i][0]
+            end = spans[i + 1][0] if i + 1 < len(lines) else total
+            txt = (ln.get("voice", "") or ln.get("cap", "")).strip()
+            events.append((start, end, txt, False))
     ass = os.path.join(workdir, "caps.ass")
     build_ass(events, ass, HANDLE, total)
 
@@ -415,8 +429,8 @@ def build_video(script, out_path, workdir):
     ass_esc = ass.replace("\\","/").replace(":","\\:")
     if bgv:
         inputs = ["-i", bgv]
-        base_vf = ("eq=brightness=-0.05:saturation=1.12,"
-                   "drawbox=0:0:1080:1920:color=black@0.40:t=fill,"
+        base_vf = ("eq=brightness=-0.03:saturation=1.18:contrast=1.05,"
+                   "drawbox=0:0:1080:1920:color=black@0.28:t=fill,"
                    f"subtitles='{ass_esc}',setsar=1")
     else:
         inputs = ["-loop","1","-i", grad]
@@ -448,16 +462,19 @@ def build_video(script, out_path, workdir):
     ai_voice = 2 if has_chart else 1
     if music_file:
         ai_mus = ai_voice + 1
-        fc += (f";[{ai_voice}:a]volume=1.0[vo];[{ai_mus}:a]volume=0.10[mu];"
-               f"[vo][mu]amix=inputs=2:duration=first:dropout_transition=0[a]")
+        # voz normalizada a nivel pro (-16 LUFS) y música de fondo suave
+        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11[vo];"
+               f"[{ai_mus}:a]volume=0.09[mu];"
+               f"[vo][mu]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
         amap = "[a]"
     else:
-        amap = f"{ai_voice}:a"
+        fc += f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11[a]"
+        amap = "[a]"
 
     cmd = ["ffmpeg","-y","-loglevel","error"] + inputs + [
         "-filter_complex",fc,"-map","[v]","-map",amap,
         "-t",f"{total:.2f}","-r","30",
-        "-c:v","libx264","-preset","medium","-crf","20","-pix_fmt","yuv420p",
+        "-c:v","libx264","-preset","medium","-crf","18","-pix_fmt","yuv420p",
         "-c:a","aac","-b:a","192k","-movflags","+faststart", out_path]
     run(cmd)
     return total
@@ -467,7 +484,6 @@ def pick_script(scripts, arg=None):
         for s in scripts:
             if s["id"] == arg:
                 return s
-    # un guion distinto cada día Y en cada ejecución (usa el nº de ejecución de GitHub)
     import datetime
     yday = datetime.date.today().timetuple().tm_yday
     run = int(os.environ.get("GITHUB_RUN_NUMBER", "0") or "0")
@@ -492,11 +508,15 @@ def main():
     out = os.path.join(OUTPUT, f"{s['id']}.mp4")
     with tempfile.TemporaryDirectory() as wd:
         total = build_video(s, out, wd)
+    # Asegura #Shorts (ayuda a que YouTube lo clasifique como Short)
+    tags = [h.lstrip("#") for h in s.get("hashtags", [])]
+    if not any(t.lower() == "shorts" for t in tags):
+        tags = ["Shorts"] + tags
     meta = {
         "video": out,
         "title": s["title"],
-        "description": s["description"].rstrip() + "\n\n" + " ".join("#"+h for h in s.get("hashtags",[])),
-        "tags": s.get("hashtags",[]),
+        "description": s["description"].rstrip() + "\n\n" + " ".join("#"+t for t in tags),
+        "tags": tags,
     }
     with open(os.path.join(OUTPUT, f"{s['id']}.json"),"w",encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
