@@ -8,7 +8,12 @@ Devuelve un dict con el mismo formato que usa generate.py.
 import os, sys, json, datetime, urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
+MODEL = os.environ.get("GEMINI_MODEL", "").strip()  # vacio = autodetectar modelo valido
+# Candidatos por si ListModels no responde (de mas nuevo a mas compatible).
+_MODEL_CANDIDATES = [
+    "gemini-flash-latest", "gemini-2.5-flash", "gemini-2.0-flash",
+    "gemini-2.5-flash-lite", "gemini-2.0-flash-001", "gemini-1.5-flash",
+]
 BGS = ["blue", "green", "orange", "purple", "teal", "red"]
 
 # Temas y formatos que rotan por día para no repetir (anti "contenido inauténtico")
@@ -53,21 +58,46 @@ Reglas del guion:
 - Español, cercano, directo y con GARRA (tono motivacional que impacte y active). Frases cortas y potentes.
 """
 
-def _run_seed():
-    # Número de ejecución del workflow: cambia en CADA run, también el mismo día.
-    try:
-        return int(os.environ.get("GITHUB_RUN_NUMBER", "0"))
-    except ValueError:
-        return 0
-
-def _pick(lst, salt=0):
-    # Combina el día del año con el número de ejecución: así dos vídeos
-    # generados el MISMO día eligen tema/formato distintos (no se repiten).
+def _pick(lst):
     y = datetime.date.today().timetuple().tm_yday
-    return lst[(y + _run_seed() + salt) % len(lst)]
+    return lst[y % len(lst)]
 
-def _call_gemini(prompt, key):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent?key={key}"
+def _list_models(key):
+    """Pregunta a Google que modelos existen de verdad para esta clave."""
+    try:
+        url = ("https://generativelanguage.googleapis.com/v1beta/models"
+               f"?key={key}&pageSize=200")
+        with urllib.request.urlopen(url, timeout=30) as r:
+            data = json.loads(r.read().decode())
+        out = []
+        for m in data.get("models", []):
+            if "generateContent" in (m.get("supportedGenerationMethods") or []):
+                out.append(m.get("name", "").replace("models/", ""))
+        return out
+    except Exception:
+        return []
+
+def _model_order(key):
+    """Orden a probar: modelo forzado por env -> candidatos -> los reales
+    de la cuenta (priorizando 'flash')."""
+    order = []
+    if MODEL:
+        order.append(MODEL)
+    for m in _MODEL_CANDIDATES:
+        if m not in order:
+            order.append(m)
+    disc = _list_models(key)
+    for m in disc:
+        if "flash" in m and m not in order:
+            order.append(m)
+    for m in disc:
+        if m not in order:
+            order.append(m)
+    return order
+
+def _post_generate(model, prompt, key):
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+           f"{model}:generateContent?key={key}")
     body = json.dumps({
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.95, "responseMimeType": "application/json"},
@@ -76,6 +106,19 @@ def _call_gemini(prompt, key):
     with urllib.request.urlopen(req, timeout=60) as r:
         data = json.loads(r.read().decode())
     return data["candidates"][0]["content"]["parts"][0]["text"]
+
+def _call_gemini(prompt, key):
+    """Prueba varios modelos y usa el primero que responda (sobrevive a que
+    Google jubile un modelo). Solo falla si NINGUNO funciona."""
+    last = None
+    for model in _model_order(key):
+        try:
+            txt = _post_generate(model, prompt, key)
+            sys.stderr.write(f"[ai] modelo usado: {model}\n")
+            return txt
+        except Exception as e:
+            last = e
+    raise RuntimeError(f"ningun modelo Gemini respondio: {last}")
 
 def _validate(s):
     assert isinstance(s.get("lines"), list) and 6 <= len(s["lines"]) <= 16, "líneas fuera de rango"
@@ -103,14 +146,10 @@ def generate():
         master = open(os.path.join(BASE, "PROMPT-MAESTRO.md"), encoding="utf-8").read()
     except Exception:
         master = "Eres un productor experto de YouTube Shorts de economía en español."
-    tema, formato = _pick(TEMAS), _pick(FORMATOS, salt=2)
-    seed = _run_seed()
+    tema, formato = _pick(TEMAS), _pick(FORMATOS)
     prompt = (master
               + "\n\n---\nTAREA DE HOY:\n"
               + f"Crea el Short de hoy sobre: {tema}. Formato: {formato}.\n"
-              + f"Dale un ENFOQUE ORIGINAL y distinto a cualquier vídeo anterior "
-              + f"(variación #{seed}): cambia el gancho, el ejemplo y las frases exactas. "
-              + "No repitas estructuras ni frases hechas.\n"
               + "Cumple TODAS las reglas de arriba (cumplimiento primero, luego viralidad).\n"
               + SCHEMA_INSTRUCCION)
     try:
