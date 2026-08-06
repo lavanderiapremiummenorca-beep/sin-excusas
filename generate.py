@@ -29,13 +29,33 @@ def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         sys.stderr.write("CMD FAIL: " + " ".join(cmd[:6]) + "...\n" + r.stderr[-1500:] + "\n")
-        raise SystemExit(1)
+        # RuntimeError (no SystemExit) para que quien llama pueda capturarlo y
+        # tirar del plan B (p.ej. fondo de reserva) en vez de tumbar todo el proceso.
+        raise RuntimeError("ffmpeg/cmd falló: " + " ".join(cmd[:3]))
     return r
 
 def dur_of(path):
     r = subprocess.run(["ffprobe","-v","error","-show_entries","format=duration",
                         "-of","csv=p=0", path], capture_output=True, text=True)
-    return float(r.stdout.strip())
+    try:
+        return float(r.stdout.strip())
+    except Exception:
+        return 0.0
+
+def _valid_video(path, min_dur=0.4):
+    """True solo si el archivo existe, tiene stream de vídeo y dura lo suficiente.
+    Evita usar clips descargados a medias/corruptos (causa de vídeos sin imagen)."""
+    try:
+        if not (os.path.exists(path) and os.path.getsize(path) > 10000):
+            return False
+        r = subprocess.run(["ffprobe","-v","error","-select_streams","v:0",
+                            "-show_entries","stream=codec_type","-of","csv=p=0", path],
+                           capture_output=True, text=True)
+        if "video" not in r.stdout:
+            return False
+        return dur_of(path) >= min_dur
+    except Exception:
+        return False
 
 # ---------- TTS ----------
 def synth_espeak(text, out_wav):
@@ -182,7 +202,7 @@ def _pexels_clips(query, n, workdir):
             try:
                 with urllib.request.urlopen(files[0]["link"], timeout=20) as r, open(dst, "wb") as f:
                     f.write(r.read())
-                if os.path.getsize(dst) > 10000:
+                if _valid_video(dst):
                     out.append(dst)
             except Exception:
                 pass
@@ -218,7 +238,7 @@ def _pixabay_clips(query, n, workdir):
                 rq = urllib.request.Request(f["url"], headers={"User-Agent": "canal-bot/1.0"})
                 with urllib.request.urlopen(rq, timeout=20) as r, open(dst, "wb") as fo:
                     fo.write(r.read())
-                if os.path.getsize(dst) > 10000:
+                if _valid_video(dst):
                     out.append(dst)
             except Exception:
                 pass
@@ -296,7 +316,7 @@ def build_background(script, total, workdir, spans):
         out = os.path.join(workdir, f"bgseg_{k}.mp4")
         try:
             _norm_clip(srcs[k], dur + 0.1, out)
-            if os.path.getsize(out) > 5000:
+            if _valid_video(out, 0.3):
                 segs.append(out)
         except Exception as e:
             sys.stderr.write(f"[bg] clip {k} no sirvió ({e})\n")
@@ -309,10 +329,14 @@ def build_background(script, total, workdir, spans):
     bgv = os.path.join(workdir, "bg.mp4")
     try:
         run(["ffmpeg","-y","-loglevel","error","-f","concat","-safe","0","-i",lst,"-c","copy", bgv])
-        return bgv
     except Exception as e:
         sys.stderr.write(f"[bg] concat falló ({e})\n")
         return None
+    # Verificación final: si el fondo montado no es un vídeo válido, usar degradado.
+    if not _valid_video(bgv, 1.0):
+        sys.stderr.write("[bg] bg.mp4 no válido; uso degradado.\n")
+        return None
+    return bgv
 
 # ---------- Audio ----------
 def build_audio(lines, workdir):
@@ -423,20 +447,26 @@ def build_video(script, out_path, workdir):
         if tracks:
             import datetime
             yday = datetime.date.today().timetuple().tm_yday
-            run_n = int(os.environ.get("GITHUB_RUN_NUMBER", "0") or "0")
-            music_file = tracks[(yday + run_n) % len(tracks)]   # va alternando
+            music_file = tracks[yday % len(tracks)]   # rota 1 por día (recorre todas)
+
+    # ---- COLA FINAL: la última frase respira y la música se apaga con suavidad ----
+    TAIL = 0.9
+    final_dur = total + TAIL
+    vfade = f"fade=t=out:st={max(0.0, final_dur-0.6):.2f}:d=0.6"
 
     ass_esc = ass.replace("\\","/").replace(":","\\:")
     if bgv:
         inputs = ["-i", bgv]
+        # tpad: congela el último fotograma durante la cola (el fondo nunca se queda corto)
         base_vf = ("eq=brightness=-0.03:saturation=1.18:contrast=1.05,"
                    "drawbox=0:0:1080:1920:color=black@0.28:t=fill,"
-                   f"subtitles='{ass_esc}',setsar=1")
+                   f"tpad=stop_mode=clone:stop_duration={TAIL+1.0:.2f},"
+                   f"subtitles='{ass_esc}',{vfade},setsar=1")
     else:
         inputs = ["-loop","1","-i", grad]
         base_vf = (f"scale=1188:2112,zoompan=z='min(1.0+0.00045*in,1.12)':d=1:"
                    f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s=1080x1920:fps=30,"
-                   f"subtitles='{ass_esc}',setsar=1")
+                   f"subtitles='{ass_esc}',{vfade},setsar=1")
     if has_chart:
         inputs += ["-loop","1","-i",chart_path]
     inputs += ["-i", full_wav]
@@ -447,9 +477,11 @@ def build_video(script, out_path, workdir):
     if has_chart:
         cl = script.get("chart_lines")
         if cl:
-            i0 = max(0, min(int(cl[0]), len(events)-1))
-            i1 = max(0, min(int(cl[1]), len(events)-1))
-            cs, ce = events[i0][0], events[i1][1]
+            # chart_lines son índices de LÍNEA -> usar spans (por línea), no events
+            # (que ahora van por palabra). Así la gráfica sale en el momento correcto.
+            i0 = max(0, min(int(cl[0]), len(spans)-1))
+            i1 = max(0, min(int(cl[1]), len(spans)-1))
+            cs, ce = spans[i0][0], spans[i1][1]
         else:
             c = script.get("chart_window",[0,total]); cs, ce = float(c[0]), float(c[1])
         fc += (f"[1:v]scale=1080:1920:force_original_aspect_ratio=decrease,"
@@ -460,24 +492,27 @@ def build_video(script, out_path, workdir):
         fc += "[base]null[v]"
 
     ai_voice = 2 if has_chart else 1
+    # La voz se alarga con silencio hasta final_dur; la música (en bucle) rellena
+    # la cola y TODO se funde suavemente al final (nada de corte en seco).
     if music_file:
         ai_mus = ai_voice + 1
-        # voz normalizada a nivel pro (-16 LUFS) y música de fondo suave
-        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11[vo];"
+        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,apad=whole_dur={final_dur:.2f}[vo];"
                f"[{ai_mus}:a]volume=0.09[mu];"
-               f"[vo][mu]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a]")
+               f"[vo][mu]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+               f"afade=t=out:st={total:.2f}:d={TAIL:.2f}[a]")
         amap = "[a]"
     else:
-        fc += f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11[a]"
+        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,apad=whole_dur={final_dur:.2f},"
+               f"afade=t=out:st={total:.2f}:d={TAIL:.2f}[a]")
         amap = "[a]"
 
     cmd = ["ffmpeg","-y","-loglevel","error"] + inputs + [
         "-filter_complex",fc,"-map","[v]","-map",amap,
-        "-t",f"{total:.2f}","-r","30",
+        "-t",f"{final_dur:.2f}","-r","30",
         "-c:v","libx264","-preset","medium","-crf","18","-pix_fmt","yuv420p",
         "-c:a","aac","-b:a","192k","-movflags","+faststart", out_path]
     run(cmd)
-    return total
+    return final_dur
 
 def pick_script(scripts, arg=None):
     if arg:
@@ -486,8 +521,10 @@ def pick_script(scripts, arg=None):
                 return s
     import datetime
     yday = datetime.date.today().timetuple().tm_yday
-    run = int(os.environ.get("GITHUB_RUN_NUMBER", "0") or "0")
-    return scripts[(yday + run) % len(scripts)]
+    # avanza de 1 en 1 por día -> recorre TODO el banco sin repetir durante
+    # 'len' días (antes sumaba GITHUB_RUN_NUMBER y saltaba de 2 en 2, así que
+    # solo usaba la mitad del banco y repetía cada pocos días).
+    return scripts[yday % len(scripts)]
 
 def main():
     with open(os.path.join(BASE,"scripts.json"),encoding="utf-8") as f:
