@@ -5,7 +5,7 @@ Se activa solo si existe GEMINI_API_KEY. Si falla algo, devuelve None
 y el sistema usa el banco de guiones (scripts.json) como reserva.
 Devuelve un dict con el mismo formato que usa generate.py.
 """
-import os, sys, json, datetime, urllib.request
+import os, sys, json, datetime, random, urllib.request
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.environ.get("GEMINI_MODEL", "").strip()  # vacio = autodetectar modelo valido
@@ -146,10 +146,18 @@ def generate():
         master = open(os.path.join(BASE, "PROMPT-MAESTRO.md"), encoding="utf-8").read()
     except Exception:
         master = "Eres un productor experto de YouTube Shorts de economía en español."
-    tema, formato = _pick(TEMAS), _pick(FORMATOS)
+    formato = random.choice(FORMATOS)
+    hoy = datetime.date.today().isoformat()
+    # Usamos TEMAS solo como "lo obvio a EVITAR", para empujar novedad
+    evitar = ", ".join(random.sample(TEMAS, min(6, len(TEMAS)))) if TEMAS else ""
     prompt = (master
-              + "\n\n---\nTAREA DE HOY:\n"
-              + f"Crea el Short de hoy sobre: {tema}. Formato: {formato}.\n"
+              + f"\n\n---\nTAREA DE HOY ({hoy}):\n"
+              + "ELIGE TU MISMO un tema NUEVO, especifico y original dentro de la tematica "
+                "de ESTE canal (segun las instrucciones de arriba). Sorprendeme con un angulo "
+                "fresco y concreto; evita los topicos mas manidos y ya vistos.\n"
+              + (f"Para forzar variedad, HOY NO trates sobre estos (elige algo distinto): {evitar}.\n" if evitar else "")
+              + f"Desarrollalo con este enfoque/formato: {formato}.\n"
+              + "Debe ser un tema DISTINTO cada dia; se original.\n"
               + "Cumple TODAS las reglas de arriba (cumplimiento primero, luego viralidad).\n"
               + SCHEMA_INSTRUCCION)
     try:
