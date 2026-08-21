@@ -1,11 +1,11 @@
 name: Publicar Short diario
 
-# Una sola publicación al día, SIN "candado" de hora (el candado hacía que,
-# si GitHub lanzaba la tarea con retraso, se saltara el día entero).
+# Se ejecuta solo cada día, y también puedes lanzarlo a mano
+# (pestaña Actions -> "Publicar Short diario" -> Run workflow).
 on:
   schedule:
-    - cron: "26 7 * * *"     # ~09:26 España
-  workflow_dispatch:
+    - cron: "0 16 * * *"      # 16:00 UTC ≈ 18:00 en España (verano)
+  workflow_dispatch:            # botón para ejecutarlo manualmente HOY
 
 permissions:
   contents: read
@@ -14,26 +14,32 @@ jobs:
   publicar:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Descargar el repo
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Instalar ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
       - name: Instalar dependencias
         run: pip install -r requirements.txt
-      - name: Generar el video del dia
+
+      - name: Generar el vídeo del día (voz neuronal edge-tts)
         env:
           TTS_ENGINE: edge
           EDGE_VOICE: es-ES-AlvaroNeural
-          EDGE_RATE: ${{ secrets.EDGE_RATE }}
-          CHANNEL_HANDLE: ${{ secrets.CHANNEL_HANDLE }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
-          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          # Opcionales: si añades estos secrets, se activan solos.
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}   # IA escribe el guion (PROMPT-MAESTRO.md)
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}   # fondo de vídeo real
         run: python generate.py
-      - name: Espera pequena (no publicar al segundo exacto)
-        run: sleep $((RANDOM % 240))
+
+      - name: Espera aleatoria (parecer publicación humana, no bot)
+        run: sleep $((RANDOM % 1500))
+
       - name: Subir a YouTube
         env:
           YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
@@ -42,7 +48,16 @@ jobs:
           YT_PRIVACY: public
           YT_CATEGORY: "27"
         run: python upload.py
-      - name: Guardar el video como artefacto
+
+      - name: Guardar copia en Google Drive (para Repurpose -> TikTok + Instagram)
+        env:
+          GDRIVE_CLIENT_ID: ${{ secrets.GDRIVE_CLIENT_ID }}
+          GDRIVE_CLIENT_SECRET: ${{ secrets.GDRIVE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: python upload_drive.py
+
+      - name: Guardar el vídeo como artefacto (por si quieres descargarlo)
         uses: actions/upload-artifact@v4
         with:
           name: video-del-dia
