@@ -24,6 +24,7 @@ EDGE_VOICE = os.environ.get("EDGE_VOICE", "es-ES-AlvaroNeural")
 GAP = 0.07          # (ya no se usa; voz continua)
 FONT = "DejaVu Sans"
 HANDLE = os.environ.get("CHANNEL_HANDLE", "").strip()  # tu marca en pantalla (vacío = sin marca)
+VOICE_VOL = os.environ.get("VOICE_VOL", "1.0")  # volumen de la voz: 1.0 = normal; 0.8 = más bajo/tranquilo
 
 def run(cmd):
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -93,8 +94,81 @@ def synth_edge_full(text, out_wav):
     os.remove(tmp_mp3)
     return words
 
+def synth_eleven_full(text, out_wav):
+    """Locucion premium con ElevenLabs + tiempos por palabra (endpoint
+    with-timestamps). Devuelve lista [(inicio_s, duracion_s, palabra), ...],
+    EXACTAMENTE el mismo formato que synth_edge_full, para que los subtitulos
+    palabra por palabra sigan sincronizados sin tocar el resto del codigo."""
+    import base64
+    key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    voice = os.environ.get("ELEVEN_VOICE_ID", "").strip()
+    if not key:
+        raise RuntimeError("falta ELEVENLABS_API_KEY")
+    if not voice:
+        raise RuntimeError("falta ELEVEN_VOICE_ID")
+    model = os.environ.get("ELEVEN_MODEL", "eleven_flash_v2_5")
+    fmt = os.environ.get("ELEVEN_FORMAT", "mp3_44100_128")
+    payload = {"text": text, "model_id": model}
+    lang = os.environ.get("ELEVEN_LANG", "").strip()      # opcional: "es" fuerza idioma
+    if lang:
+        payload["language_code"] = lang
+    url = ("https://api.elevenlabs.io/v1/text-to-speech/"
+           + voice + "/with-timestamps?output_format=" + fmt)
+    req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
+                                 headers={"xi-api-key": key,
+                                          "Content-Type": "application/json",
+                                          "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    b64 = data.get("audio_base64") or data.get("audio")
+    if not b64:
+        raise RuntimeError("respuesta de ElevenLabs sin audio")
+    tmp_mp3 = out_wav + ".mp3"
+    with open(tmp_mp3, "wb") as f:
+        f.write(base64.b64decode(b64))
+    run(["ffmpeg","-y","-loglevel","error","-i",tmp_mp3,"-ar","44100","-ac","2",out_wav])
+    os.remove(tmp_mp3)
+    # Reconstruye tiempos por PALABRA a partir del alineado por CARACTER
+    al = data.get("alignment") or data.get("normalized_alignment") or {}
+    chars = al.get("characters") or []
+    starts = al.get("character_start_times_seconds") or []
+    ends = al.get("character_end_times_seconds") or []
+    words = []
+    cur = ""; w_start = None; w_end = 0.0
+    for i, ch in enumerate(chars):
+        st = starts[i] if i < len(starts) else w_end
+        en = ends[i] if i < len(ends) else st
+        if ch.isspace():
+            if cur:
+                s0 = w_start if w_start is not None else 0.0
+                words.append((s0, max(0.01, w_end - s0), cur)); cur = ""; w_start = None
+        else:
+            if w_start is None:
+                w_start = st
+            cur += ch; w_end = en
+    if cur:
+        s0 = w_start if w_start is not None else 0.0
+        words.append((s0, max(0.01, w_end - s0), cur))
+    return words
+
+def synth_full(text, out_wav):
+    """Locucion completa de una vez + tiempos de palabra. Usa ElevenLabs si
+    esta configurado (TTS_ENGINE=eleven y hay API key) y CAE a edge-tts si algo
+    falla, para no perder nunca el video del dia."""
+    if TTS_ENGINE == "eleven" and os.environ.get("ELEVENLABS_API_KEY"):
+        try:
+            w = synth_eleven_full(text, out_wav)
+            sys.stderr.write("[tts] voz: ElevenLabs (" +
+                             os.environ.get("ELEVEN_MODEL", "eleven_flash_v2_5") + ")\n")
+            return w
+        except Exception as e:
+            sys.stderr.write("[tts] ElevenLabs fallo (%s); uso edge-tts.\n" % e)
+    return synth_edge_full(text, out_wav)
+
 def synth(text, out_wav):
-    if TTS_ENGINE == "edge":
+    # 'eleven' usa la locucion premium en build_audio; si por lo que sea se llega
+    # aqui (reparto frase a frase), usamos edge (existe en el runner), NUNCA espeak.
+    if TTS_ENGINE in ("edge", "eleven"):
         synth_edge(text, out_wav)
     else:
         synth_espeak(text, out_wav)
@@ -284,16 +358,83 @@ def _groups(nlines, n):
         idx += cnt
     return [g for g in gs if g]
 
+def _falai_clip(prompt, workdir, idx):
+    """Genera UN clip cinematografico con IA (Kling via fal.ai). Devuelve la ruta
+    del mp4 o None. Si falla por lo que sea, devuelve None y el motor usa stock."""
+    key = os.environ.get("FAL_KEY", "").strip()
+    if not key or not prompt:
+        return None
+    import time
+    model = os.environ.get("FAL_MODEL", "fal-ai/kling-video/v2.5-turbo/pro/text-to-video")
+    dur = os.environ.get("FAL_DURATION", "5")
+    style = os.environ.get("FAL_STYLE", "cinematic, slow motion, highly detailed, soft natural light")
+    full = (prompt + ", " + style).strip(", ")
+    try:
+        body = json.dumps({"prompt": full, "duration": str(dur), "aspect_ratio": "9:16"}).encode()
+        req = urllib.request.Request("https://queue.fal.run/" + model, data=body,
+              headers={"Authorization": "Key " + key, "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            sub = json.loads(r.read().decode())
+        status_url = sub.get("status_url"); response_url = sub.get("response_url")
+        if not status_url or not response_url:
+            return None
+        for _ in range(70):                      # espera hasta ~6 min
+            rq = urllib.request.Request(status_url, headers={"Authorization": "Key " + key})
+            with urllib.request.urlopen(rq, timeout=30) as r:
+                st = json.loads(r.read().decode())
+            s = st.get("status")
+            if s == "COMPLETED":
+                break
+            if s in ("FAILED", "ERROR", "CANCELED"):
+                sys.stderr.write(f"[bg] fal.ai estado {s}; uso stock.\n"); return None
+            time.sleep(5)
+        else:
+            sys.stderr.write("[bg] fal.ai tardo demasiado; uso stock.\n"); return None
+        rq = urllib.request.Request(response_url, headers={"Authorization": "Key " + key})
+        with urllib.request.urlopen(rq, timeout=60) as r:
+            res = json.loads(r.read().decode())
+        vid = ((res.get("video") or {}).get("url")
+               or (res.get("output") or {}).get("url")
+               or (res.get("videos", [{}])[0].get("url") if res.get("videos") else None))
+        if not vid:
+            return None
+        dst = os.path.join(workdir, f"ai_{idx}.mp4")
+        rq2 = urllib.request.Request(vid, headers={"User-Agent": "canal-bot/1.0"})
+        with urllib.request.urlopen(rq2, timeout=180) as r, open(dst, "wb") as f:
+            f.write(r.read())
+        if _valid_video(dst):
+            print(f"[bg] clip IA (Kling) para: {prompt[:40]}")
+            return dst
+        return None
+    except Exception as e:
+        sys.stderr.write(f"[bg] fal.ai fallo ({e}); uso stock.\n")
+        return None
+
 def build_background(script, total, workdir, spans):
-    """Fondo dinámico: un clip real por IDEA, con push-in. None si no hay clips."""
+    """Fondo dinámico: un clip por IDEA, con push-in. Usa metraje IA (Kling) para los
+    primeros AI_CLIPS 'hero' si hay FAL_KEY, y stock para el resto. None si no hay clips."""
     srcs = []
     blist = script.get("broll_list")
-    if blist and not os.environ.get("LOCAL_BROLL_DIR") and (
-            os.environ.get("PEXELS_API_KEY") or os.environ.get("PIXABAY_API_KEY")):
-        for q in blist:
-            cs = _clips_for_query(q, 1, workdir)
-            if cs:
-                srcs.append(cs[0])
+    try:
+        ai_max = int(os.environ.get("AI_CLIPS", "0"))
+    except ValueError:
+        ai_max = 0
+    have_stock = bool(os.environ.get("PEXELS_API_KEY") or os.environ.get("PIXABAY_API_KEY"))
+    have_ai = bool(os.environ.get("FAL_KEY"))
+    ai_done = 0
+    if blist and not os.environ.get("LOCAL_BROLL_DIR") and (have_stock or have_ai):
+        for i, q in enumerate(blist):
+            clip = None
+            if have_ai and ai_done < ai_max:
+                clip = _falai_clip(q, workdir, i)
+                if clip:
+                    ai_done += 1
+            if not clip and have_stock:
+                cs = _clips_for_query(q, 1, workdir)
+                if cs:
+                    clip = cs[0]
+            if clip:
+                srcs.append(clip)
     if not srcs:
         srcs = _gather_clips(script, workdir)
     if not srcs:
@@ -340,8 +481,8 @@ def build_background(script, total, workdir, spans):
 
 # ---------- Audio ----------
 def build_audio(lines, workdir):
-    # edge: una sola locución continua (fluida) + tiempos de palabra reales
-    if TTS_ENGINE == "edge":
+    # edge/eleven: una sola locución continua (fluida) + tiempos de palabra reales
+    if TTS_ENGINE in ("edge", "eleven"):
         try:
             return _audio_oneshot(lines, workdir)
         except Exception as e:
@@ -351,7 +492,7 @@ def build_audio(lines, workdir):
 def _audio_oneshot(lines, workdir):
     full = os.path.join(workdir, "full.wav")
     text = _tts_join(lines)
-    words = synth_edge_full(text, full)
+    words = synth_full(text, full)
     total = dur_of(full)
     if total <= 0:
         raise RuntimeError("audio vacío")
@@ -496,13 +637,13 @@ def build_video(script, out_path, workdir):
     # la cola y TODO se funde suavemente al final (nada de corte en seco).
     if music_file:
         ai_mus = ai_voice + 1
-        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,apad=whole_dur={final_dur:.2f}[vo];"
+        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,volume={VOICE_VOL},apad=whole_dur={final_dur:.2f}[vo];"
                f"[{ai_mus}:a]volume=0.09[mu];"
                f"[vo][mu]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
                f"afade=t=out:st={total:.2f}:d={TAIL:.2f}[a]")
         amap = "[a]"
     else:
-        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,apad=whole_dur={final_dur:.2f},"
+        fc += (f";[{ai_voice}:a]loudnorm=I=-16:TP=-1.5:LRA=11,volume={VOICE_VOL},apad=whole_dur={final_dur:.2f},"
                f"afade=t=out:st={total:.2f}:d={TAIL:.2f}[a]")
         amap = "[a]"
 
