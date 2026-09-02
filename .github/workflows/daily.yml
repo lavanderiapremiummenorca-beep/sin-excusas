@@ -1,8 +1,8 @@
 name: Publicar Short diario
 on:
   schedule:
-    - cron: "26 7 * * *"     # ~09:26 Espana (UTC). Una sola vez al dia, fiable.
-  workflow_dispatch:          # boton para lanzarlo a mano cuando quieras
+    - cron: "26 7 * * *"
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -21,10 +21,11 @@ jobs:
         env:
           TTS_ENGINE: eleven
           ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
-          ELEVEN_VOICE_ID: "PEGA_AQUI_EL_VOICE_ID"
+          ELEVEN_VOICE_ID: "7GDFb3qyTg0QPDZcoRkN"
           ELEVEN_MODEL: eleven_flash_v2_5
           FAL_KEY: ${{ secrets.FAL_KEY }}
-          AI_CLIPS: "2"
+          VISUAL_MODE: photos
+          AI_HERO_CLIPS: "1"
           EDGE_VOICE: es-ES-AlvaroNeural
           EDGE_RATE: "+0%"
           CHANNEL_HANDLE: ${{ secrets.CHANNEL_HANDLE }}
