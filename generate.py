@@ -749,7 +749,9 @@ def build_background(script, total, workdir, spans):
         pb = _build_photo_bg(script, total, workdir, spans)
         if pb:
             return pb
-        # si el modo fotos no consigue imagenes, cae al modo video normal
+        # En modo FOTOS NO caemos a stock: si no hay imagenes de IA, devolvemos None
+        # para que salte el freno de calidad y NO se publique un video con fondo generico.
+        return None
     srcs = []
     blist = script.get("broll_list")
     try:
