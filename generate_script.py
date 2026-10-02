@@ -233,7 +233,7 @@ def _validate(s, tema="", cta="", broll_en=""):
     tiene_num = any(c.isdigit() for c in t) or any(w in low for w in
         ("tres", "cuatro", "cinco", "dos"))
     tiene_power = any(p in low for p in POWER)
-    if not t or not (tiene_num or tiene_power):
+    if not t:
         base = (tema or TEMA_GENERICO).strip()
         t = TITULO_FALLBACK.format(base=base)
     if "#short" not in low:
